@@ -5,8 +5,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 import pandas as pd
-from transformers import BertModel, BertTokenizerFast
-
+from transformers import BertModel, PreTrainedTokenizerFast
+from torch.optim.lr_scheduler import StepLR
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Adversarial Sound Symbolism Model with BERT')
@@ -28,10 +28,6 @@ def parse_args():
 
 
 class IPADataset(Dataset):
-    """
-    Dataset wrapping transcriptions and labels, tokenized with BERT tokenizer.
-    Returns: inputs_dict, symbolism_label, language_label
-    """
     def __init__(self, df, tokenizer, max_length):
         self.texts = df['transcription'].tolist()
         self.symbolism_labels = torch.tensor(df['label'].values, dtype=torch.long)
@@ -52,65 +48,54 @@ class IPADataset(Dataset):
 
 
 class AdversarialSoundSymbolismModel(nn.Module):
-    def __init__(
-        self,
-        bert_model_name_or_path: str,
-        embedding_dim: int,
-        num_languages: int,
-        lambda_param: float
-    ):
+    def __init__(self, bert_model_name_or_path: str, embedding_dim: int, num_languages: int, lambda_param: float):
         super().__init__()
-        # Load pretrained BERT
         self.bert = BertModel.from_pretrained(bert_model_name_or_path)
         hidden_size = self.bert.config.hidden_size
-        # Single linear layers for projection and classification
         self.embedding_layer = nn.Linear(hidden_size, embedding_dim)
+        self.dropout = nn.Dropout(0.4)
         self.size_classifier = nn.Linear(embedding_dim, 2)
         self.language_classifier = nn.Linear(embedding_dim, num_languages)
 
         self.lambda_param = lambda_param
 
-        # Optimizers: one for encoder+projection+size head, one for language head
         self.encoder_optimizer = optim.Adam(
             list(self.bert.parameters()) +
             list(self.embedding_layer.parameters()) +
             list(self.size_classifier.parameters()),
-            lr=2e-5, weight_decay=1e-5
+            lr=2e-5, weight_decay=1e-4
         )
         self.language_optimizer = optim.Adam(
             self.language_classifier.parameters(), lr=1e-4
         )
-
-        # Loss functions
         self.symbolism_loss_fn = nn.CrossEntropyLoss()
         self.language_loss_fn = nn.CrossEntropyLoss()
 
-    def forward_embeddings(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        # Use [CLS] token pooling
-        pooled = outputs.pooler_output  # shape: (batch, hidden)
-        embeddings = self.embedding_layer(pooled)
+    def forward_embeddings(self, input_ids, attention_mask, token_type_ids=None):
+        outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids if token_type_ids is not None else None
+        )
+        pooled = torch.mean(outputs.last_hidden_state, dim=1)
+        embeddings = self.dropout(self.embedding_layer(pooled))
         return embeddings
 
     def train_language_classifier(self, inputs, language_labels):
-        # Freeze BERT, embedding, and size head
         self.bert.eval()
         self.embedding_layer.eval()
         self.size_classifier.eval()
         self.language_classifier.train()
 
         self.language_optimizer.zero_grad()
-        # Detached embeddings
         embeddings = self.forward_embeddings(**inputs).detach()
-        # Predict language
-        lang_logits = self.language_classifier(embeddings)
+        lang_logits = self.language_classifier(self.dropout(embeddings))
         loss = self.language_loss_fn(lang_logits, language_labels)
         loss.backward()
         self.language_optimizer.step()
         return loss.item()
 
-    def train_encoder_symbolism(self, inputs, symbolism_labels, language_labels):
-        # Unfreeze BERT, embedding, and size head; freeze language head
+    def train_encoder_symbolism(self, inputs, symbolism_labels, language_labels, current_lambda):
         self.bert.train()
         self.embedding_layer.train()
         self.size_classifier.train()
@@ -118,15 +103,12 @@ class AdversarialSoundSymbolismModel(nn.Module):
 
         self.encoder_optimizer.zero_grad()
         embeddings = self.forward_embeddings(**inputs)
-        # Symbolism prediction
-        symb_logits = self.size_classifier(embeddings)
-        # Language prediction
-        lang_logits = self.language_classifier(embeddings)
+        symb_logits = self.size_classifier(self.dropout(embeddings))
+        lang_logits = self.language_classifier(self.dropout(embeddings))
 
         symb_loss = self.symbolism_loss_fn(symb_logits, symbolism_labels)
         lang_loss = self.language_loss_fn(lang_logits, language_labels)
-        # Adversarial objective: maximize language loss
-        total_loss = symb_loss - self.lambda_param * lang_loss
+        total_loss = symb_loss - current_lambda * lang_loss
         total_loss.backward()
         self.encoder_optimizer.step()
 
@@ -143,14 +125,13 @@ class AdversarialSoundSymbolismModel(nn.Module):
         total = 0
         with torch.no_grad():
             for inputs, symb_labels, lang_labels in dataloader:
-                # Move to device
                 inputs = {k: v.to(device) for k, v in inputs.items()}
                 symb_labels = symb_labels.to(device)
                 lang_labels = lang_labels.to(device)
 
                 embeddings = self.forward_embeddings(**inputs)
-                symb_preds = self.size_classifier(embeddings).argmax(dim=1)
-                lang_preds = self.language_classifier(embeddings).argmax(dim=1)
+                symb_preds = self.size_classifier(self.dropout(embeddings)).argmax(dim=1)
+                lang_preds = self.language_classifier(self.dropout(embeddings)).argmax(dim=1)
 
                 total_symb_correct += (symb_preds == symb_labels).sum().item()
                 total_lang_correct += (lang_preds == lang_labels).sum().item()
@@ -183,26 +164,37 @@ class AdversarialSoundSymbolismModel(nn.Module):
         model.load_state_dict(ckpt['state_dict'])
         return model
 
-
 def main():
-    args = parse_args()
+    class Args:
+        bert_model_name_or_path = "bert-ipa-model"
+        train_data = "../Data/corpus_clean_train.csv"
+        test_data = "../Data/corpus_clean_test.csv"
+        output = "debug_model_out"
+        epochs = 35
+        batch_size = 16
+        max_length = 64
+        embedding_dim = 16  # was 16 — set to 32 for more representational power
+        lambda_param = 0.01  # keep it small to avoid over-scrubbing
+
+    args = Args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Load data
     train_df = pd.read_csv(args.train_data)
     test_df = pd.read_csv(args.test_data)
+
+    print("LABEL CHECK:")
+    print(train_df['label'].value_counts())
+    print("Label dtype:", train_df['label'].dtype)
+    print(train_df[['transcription', 'label']].sample(5))
+
     num_languages = len(train_df['lang_fam'].unique())
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.bert_model_name_or_path)
 
-    # Tokenizer
-    tokenizer = BertTokenizerFast.from_pretrained(args.bert_model_name_or_path)
-
-    # Datasets & Dataloaders
     train_ds = IPADataset(train_df, tokenizer, args.max_length)
-    test_ds  = IPADataset(test_df,  tokenizer, args.max_length)
+    test_ds = IPADataset(test_df, tokenizer, args.max_length)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
-    test_loader  = DataLoader(test_ds,  batch_size=args.batch_size)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size)
 
-    # Model
     model = AdversarialSoundSymbolismModel(
         bert_model_name_or_path=args.bert_model_name_or_path,
         embedding_dim=args.embedding_dim,
@@ -210,42 +202,48 @@ def main():
         lambda_param=args.lambda_param
     ).to(device)
 
-    # Training loop
+    print("\n=== Beginning sanity training ===")
     for epoch in range(args.epochs):
         total_symb_loss = 0.0
         total_lang_adv_loss = 0.0
-        total_lang_clf_loss = 0.0
         nbatches = 0
         model.train()
-        for inputs, symb_labels, lang_labels in train_loader:
+
+        # Lambda annealing: no adv training until epoch 10, then gradually increase
+        if epoch < 10:
+            current_lambda = 0.0
+        else:
+            current_lambda = args.lambda_param * (1 - 0.95 ** (epoch - 9))
+
+        for i, (inputs, symb_labels, lang_labels) in enumerate(train_loader):
             nbatches += 1
-            # Move labels
+            inputs = {k: v.to(device) for k, v in inputs.items()}
             symb_labels = symb_labels.to(device)
             lang_labels = lang_labels.to(device)
-            # Train adversary
-            clf_loss = model.train_language_classifier(
-                {k: v.to(device) for k, v in inputs.items()}, lang_labels
-            )
-            # Train embedding + symbolism
+
+            if epoch == 0 and i == 0:
+                print("\nFirst batch input_ids:", inputs["input_ids"][0])
+                print("Corresponding label:", symb_labels[0])
+
+            clf_loss = model.train_language_classifier(inputs, lang_labels)
             symb_loss, lang_adv_loss = model.train_encoder_symbolism(
-                {k: v.to(device) for k, v in inputs.items()},
-                symb_labels,
-                lang_labels
+                inputs, symb_labels, lang_labels, current_lambda
             )
-            total_lang_clf_loss += clf_loss
+
+            if i == 0:
+                logits = model.size_classifier(model.dropout(model.forward_embeddings(**inputs)))
+                print(f"\n[Epoch {epoch+1}] Raw logits from classifier:", logits[0].detach().cpu().numpy())
+
             total_symb_loss += symb_loss
             total_lang_adv_loss += lang_adv_loss
 
-        # Evaluation
         symb_acc, lang_acc = model.evaluate(test_loader, device)
         print(f"Epoch {epoch+1}/{args.epochs} | SymbLoss={total_symb_loss/nbatches:.4f} "
-              f"LangClfLoss={total_lang_clf_loss/nbatches:.4f} "
               f"LangAdvLoss={total_lang_adv_loss/nbatches:.4f} "
               f"TestSymbAcc={symb_acc:.4f} TestLangAcc={lang_acc:.4f}")
 
-    # Save model
-    model.save(args.output)
-    print(f"Model saved to {args.output}")
+    print(f"\nNumber of batches per epoch: {nbatches}")
+    print("Finished sanity check training.\n")
 
 
 if __name__ == '__main__':

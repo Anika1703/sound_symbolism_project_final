@@ -1,26 +1,19 @@
 import os
 from transformers import (
-    BertTokenizerFast, BertConfig, BertForMaskedLM,
-    Trainer, TrainingArguments, DataCollatorForLanguageModeling
+    BertConfig, BertForMaskedLM, Trainer, TrainingArguments,
+    DataCollatorForLanguageModeling, PreTrainedTokenizerFast
 )
+import torch
 from datasets import Dataset
 from pathlib import Path
+from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+import pandas as pd
 
 DATA_FILE = "wikipron_combined.tsv"
 MODEL_DIR = "bert-ipa-model"
-VOCAB_FILE = "ipa_vocab.txt"
 MAX_LEN = 64
 
-# Full list of IPA characters to use
-IPA_CHARACTERS = ['l', 'ɖ', 'θ', 'œ', 'ʉ', 'ɳ', 'ʝ', 'ʐ', 'z', 'b', 'ʱ', 'o', 'ɒ', 'ɫ', 'y', 't', 'ŋ', 'ɟ', 'd', 'ɕ', 'x', 'ʑ', 'j', 'ɥ', 'ʕ', 'f', 'c', 'ð', 'ʁ', 'ɑ', 'ɜ', 'a', 'ɭ', 'm', 'ʲ', 'v', 'h', 'ɡ', 'ʈ', 'ʔ', 'ɔ', '͡', 'k', 'ʂ', 'q', 'ə', 'χ', 'ʒ', 'ɾ', 'n', 'w', 'ɛ', 'p', 'ʏ', 'ɦ', 'ʃ', 'ɤ', 'ɪ', 'ʋ', 'ɐ', 'ɣ', 'ɽ', 'ɯ', 'ɲ', 'u', 'i', 'ʊ', 'ħ', 'ʀ', 's', 'e', 'ɨ', 'ø', 'r', 'ː', 'β', 'æ']
-
-# Create vocab file for tokenizer
-def write_vocab_file(characters, vocab_path):
-    special_tokens = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
-    with open(vocab_path, "w", encoding="utf-8") as f:
-        for token in special_tokens + characters:
-            f.write(token + "\n")
-
+# === Step 1: Load IPA data ===
 def load_ipa_data():
     lines = []
     with open(DATA_FILE, encoding="utf-8") as f:
@@ -28,24 +21,48 @@ def load_ipa_data():
             parts = line.strip().split("\t")
             if len(parts) == 2:
                 _, ipa = parts
-                char_seq = " ".join(list(ipa))  # space-separated characters
+                char_seq = ipa # space-separated characters
                 lines.append({"text": char_seq})
     return Dataset.from_list(lines)
 
 def main():
     os.makedirs(MODEL_DIR, exist_ok=True)
-    write_vocab_file(IPA_CHARACTERS, VOCAB_FILE)
 
-    tokenizer = BertTokenizerFast(vocab_file=VOCAB_FILE, do_lower_case=False, tokenize_chinese_chars=False)
-    
+    # === Step 2: Load data first (we’ll use it to train vocab) ===
     dataset = load_ipa_data()
-    print(f"✅ Loaded {len(dataset)} IPA sequences.")
+    print(f"\n✅ Loaded {len(dataset)} IPA sequences.")
 
+    # === Step 3: Build character-level tokenizer from data ===
+    trainer = trainers.WordLevelTrainer(
+        special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+    )
+
+    tokenizer_model = Tokenizer(models.WordLevel(unk_token="[UNK]"))
+    tokenizer_model.pre_tokenizer = pre_tokenizers.Split(pattern="", behavior="isolated")
+    tokenizer_model.train_from_iterator([d["text"] for d in dataset], trainer)
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer_model,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        cls_token="[CLS]",
+        sep_token="[SEP]",
+        mask_token="[MASK]"
+    )
+
+    # === Step 4: Sanity check tokenization ===
+    sample_text = dataset[0]["text"]
+    print("\n🧪 Tokenization test")
+    print("Original:", sample_text)
+    print("Tokens:", tokenizer.convert_ids_to_tokens(tokenizer(sample_text)["input_ids"]))
+
+    # === Step 5: Tokenize full dataset ===
     def tokenize(example):
         return tokenizer(example["text"], truncation=True, padding="max_length", max_length=MAX_LEN)
 
     tokenized_ds = dataset.map(tokenize, batched=True)
 
+    # === Step 6: Build BERT model ===
     config = BertConfig(
         vocab_size=tokenizer.vocab_size,
         hidden_size=128,
@@ -57,15 +74,17 @@ def main():
 
     model = BertForMaskedLM(config)
 
+    # === Step 7: Training setup ===
     args = TrainingArguments(
         output_dir=MODEL_DIR,
         per_device_train_batch_size=128,
         num_train_epochs=2,
-        logging_dir=None,  # disables TensorBoard
+        logging_dir=None,
         report_to=[], 
         logging_steps=1000,
         save_total_limit=2,
-        overwrite_output_dir=True
+        overwrite_output_dir=True,
+        no_cuda=True  # Change to False if you have a GPU
     )
 
     trainer = Trainer(
@@ -76,11 +95,12 @@ def main():
         data_collator=DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True)
     )
 
+    # === Step 8: Train and save ===
     trainer.train()
     trainer.save_model(MODEL_DIR)
     tokenizer.save_pretrained(MODEL_DIR)
 
-    print(f"✅ Trained model and tokenizer saved to {MODEL_DIR}")
+    print(f"\n✅ Trained model and tokenizer saved to {MODEL_DIR}")
 
 if __name__ == "__main__":
     main()

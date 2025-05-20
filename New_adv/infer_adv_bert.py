@@ -4,8 +4,9 @@ import torch
 import pandas as pd
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 from torch.utils.data import DataLoader
-from transformers import BertTokenizerFast
-from train_adv import AdversarialSoundSymbolismModel, IPADataset
+from transformers import PreTrainedTokenizerFast
+
+from train_adv_bert import AdversarialSoundSymbolismModel, IPADataset
 
 
 def parse_args():
@@ -26,7 +27,8 @@ def main():
 
     # Load test data
     df = pd.read_csv(args.test_data)
-    tokenizer = BertTokenizerFast.from_pretrained(args.bert_model_name_or_path)
+    tokenizer = PreTrainedTokenizerFast.from_pretrained(args.bert_model_name_or_path)
+
     test_ds = IPADataset(df, tokenizer, max_length=64)
     loader = DataLoader(test_ds, batch_size=args.batch_size)
 
